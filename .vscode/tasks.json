@@ -1,0 +1,11 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "AI Review Dry Run",
+            "type": "shell",
+            "command": "DRY_RUN=1 LLM_API_KEY=$LLM_API_KEY python .github/ai_review.py",
+            "problemMatcher": []
+        }
+    ]
+}

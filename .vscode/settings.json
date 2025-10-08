@@ -1,0 +1,15 @@
+{
+    "python.testing.pytestEnabled": true,
+    "python.analysis.typeCheckingMode": "basic",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll": true,
+      "source.organizeImports": true
+    },
+    "ruff.organizeImports": true,
+    "[python]": { "editor.defaultFormatter": "ms-python.black-formatter" },
+    "[yaml]": { "editor.formatOnSave": true },
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true
+  }
+  
