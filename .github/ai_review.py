@@ -1,8 +1,9 @@
-import os, json, subprocess, re, time, requests, sys
+import os, json, subprocess, re, time, sys
 from typing import List, Dict, Any, Tuple
+import requests  # dependency in requirements.txt
 
 REPO = os.environ.get("GITHUB_REPOSITORY")
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 CONFIDENCE_MIN = float(os.environ.get("CONFIDENCE_MIN", "0.4"))
@@ -16,29 +17,42 @@ def read_event_payload() -> dict:
         return json.load(f)
 
 def get_pr_number(ev: dict) -> int:
-    if "number" in ev: return int(ev["number"])
+    if "number" in ev:
+        return int(ev["number"])
     return int((ev.get("pull_request") or {}).get("number", 0))
 
 def get_base_head_shas(ev: dict) -> Tuple[str, str]:
     pr = ev.get("pull_request") or {}
-    base = (pr.get("base") or {}).get("sha")
-    head = (pr.get("head") or {}).get("sha")
-    if base and head: return base, head
-    # local fallback
-    base = run("git merge-base origin/HEAD HEAD")
-    head = run("git rev-parse HEAD")
+    base = (pr.get("base") or {}).get("sha") or ""
+    head = (pr.get("head") or {}).get("sha") or ""
+    # Local fallback if event doesn’t have them
+    if not base or not head:
+        try:
+            base = run("git merge-base origin/HEAD HEAD")
+            head = run("git rev-parse HEAD")
+        except Exception:
+            pass
     return base, head
 
 def get_diff(base: str, head: str) -> str:
-    # unified=3 keeps context tight; safe truncation below
-    return run(f"git diff --unified=3 {base}...{head}")
+    """Try diff; if SHAs are missing locally, fetch and retry (origin/upstream)."""
+    try:
+        return run(f"git diff --unified=3 {base}...{head}")
+    except subprocess.CalledProcessError:
+        # Try fetching the exact SHAs from known remotes
+        for remote in ("origin", "upstream"):
+            try:
+                run(f"git fetch --no-tags --prune --depth=1 {remote} {base} {head}")
+            except Exception:
+                pass
+        # Retry once
+        return run(f"git diff --unified=3 {base}...{head}")
 
 def parse_changed_files(diff: str) -> List[str]:
     files = re.findall(r'^\+\+\+ b/(.+)$', diff, flags=re.M)
     return sorted(set(f for f in files if f and f != "/dev/null"))
 
 def expand_context(files: List[str], cap_bytes=200_000) -> str:
-    """Grab small slices of touched files to give the model surrounding code."""
     out = []
     for f in files[:60]:
         try:
@@ -63,7 +77,7 @@ def preflight_secret_scan(diff: str) -> List[Dict[str, Any]]:
         if re.search(pat, diff):
             findings.append({
                 "file": "(diff)",
-                "line_range": [0,0],
+                "line_range": [0, 0],
                 "severity": "blocker",
                 "confidence": 0.95,
                 "rationale": f"{label} detected in diff. Remove and rotate immediately.",
@@ -112,7 +126,7 @@ Rules:
 
 def call_llm(prompt: str) -> str:
     if not LLM_API_KEY:
-        return '[]'  # graceful if key missing
+        return "[]"
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     body = {
@@ -142,19 +156,22 @@ def format_md(findings: List[Dict[str, Any]]) -> str:
     for f in findings:
         patch_block = f"```diff\n{f['patch']}\n```" if f.get("patch") else ""
         lines.append(
-            f"**{f['severity'].upper()}** (conf {float(f.get('confidence',0)):.2f}) — `{f.get('file','?')}` lines {f.get('line_range',[0,0])[0]}–{f.get('line_range',[0,0])[1]}\n"
+            f"**{f.get('severity','').upper()}** (conf {float(f.get('confidence',0)):.2f}) — "
+            f"`{f.get('file','?')}` lines {f.get('line_range',[0,0])[0]}–{f.get('line_range',[0,0])[1]}\n"
             f"> {f.get('rationale','')}\n{patch_block}"
         )
     return "### 🤖 AI Review Findings\n" + "\n\n".join(lines)
 
 def post_comment(pr_number: int, body: str):
     if DRY_RUN or not GITHUB_TOKEN or not REPO:
-        with open("ai_review_output.md","w") as f: f.write(body)
+        with open("ai_review_output.md", "w") as f:
+            f.write(body)
         print("DRY_RUN or missing GitHub context. Wrote ai_review_output.md")
         return
     url = f"https://api.github.com/repos/{REPO}/issues/{pr_number}/comments"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    requests.post(url, headers=headers, json={"body": body}, timeout=30)
+    r = requests.post(url, headers=headers, json={"body": body}, timeout=30)
+    r.raise_for_status()
 
 def main():
     start = time.time()
@@ -165,20 +182,19 @@ def main():
     files = parse_changed_files(diff)
     ctx = expand_context(files)
 
-    # Safety: secret scan first
     pre = preflight_secret_scan(diff)
 
     prompt = build_prompt(diff, ctx)
     try:
         raw = call_llm(prompt)
         raw = strip_fences(raw)
-        model_findings = json.loads(raw) if raw else []
-        if isinstance(model_findings, dict) and "findings" in model_findings:
-            model_findings = model_findings["findings"]
+        llm = json.loads(raw) if raw else []
+        if isinstance(llm, dict) and "findings" in llm:
+            llm = llm["findings"]
     except Exception as e:
-        model_findings = [{
+        llm = [{
             "file": "(assistant)",
-            "line_range": [0,0],
+            "line_range": [0, 0],
             "severity": "nit",
             "confidence": 0.5,
             "rationale": f"Model call or parsing failed: {e}",
@@ -186,30 +202,30 @@ def main():
         }]
 
     # Merge + filter
-    findings = pre + (model_findings if isinstance(model_findings, list) else [])
+    findings = pre + (llm if isinstance(llm, list) else [])
     filtered = []
     for f in findings:
-        sev = (f.get("severity","") or "").lower()
+        sev = (f.get("severity", "") or "").lower()
         try:
             conf = float(f.get("confidence", 0))
         except Exception:
             conf = 0.0
         if sev == "blocker" or conf >= CONFIDENCE_MIN:
             filtered.append(f)
-    findings = filtered[:30]  # cap noise
+    findings = filtered[:30]
 
-    # Metrics (simple JSONL)
+    # Metrics
     metrics = {
         "ts": int(time.time()),
         "pr": pr,
         "model": MODEL_NAME,
-        "runtime_s": round(time.time()-start, 3),
+        "runtime_s": round(time.time() - start, 3),
         "findings_total": len(findings),
-        "blockers": sum(1 for x in findings if (x.get("severity","").lower() == "blocker"))
+        "blockers": sum(1 for x in findings if (x.get("severity", "").lower() == "blocker"))
     }
     try:
-        with open("ai_review_metrics.jsonl","a") as m:
-            m.write(json.dumps(metrics)+"\n")
+        with open("ai_review_metrics.jsonl", "a") as m:
+            m.write(json.dumps(metrics) + "\n")
     except Exception:
         pass
 
