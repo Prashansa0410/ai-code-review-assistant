@@ -1,6 +1,7 @@
 import os, json, subprocess, re, time, sys
 from typing import List, Dict, Any, Tuple
 import requests  # dependency in requirements.txt
+import time, random
 
 REPO = os.environ.get("GITHUB_REPOSITORY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -127,6 +128,69 @@ Rules:
 def call_llm(prompt: str) -> str:
     if not LLM_API_KEY:
         return "[]"
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": "You are a precise code reviewer."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        # keep responses compact to reduce tokens/rate pressure
+        "max_tokens": 800
+    }
+
+    max_attempts = 6           # ~1 + 5 retries
+    base_sleep = 1.2           # seconds
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=120)
+            # Respect rate-limit signals
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = float(retry_after)
+                    except ValueError:
+                        wait = None
+                else:
+                    wait = None
+                if attempt == max_attempts:
+                    r.raise_for_status()
+                # backoff (prefer Retry-After if present)
+                sleep_s = wait if wait is not None else base_sleep * (2 ** (attempt - 1))
+                sleep_s += random.uniform(0, 0.4)  # jitter
+                time.sleep(sleep_s)
+                continue
+
+            # Retry transient 5xx
+            if 500 <= r.status_code < 600:
+                if attempt == max_attempts:
+                    r.raise_for_status()
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+                time.sleep(sleep_s)
+                continue
+
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+
+        except requests.RequestException as e:
+            # For network hiccups, retry; otherwise surface on last attempt
+            if attempt == max_attempts:
+                raise
+            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+            time.sleep(sleep_s)
+
+    # Shouldn’t reach here
+    return "[]"
+
+    if not LLM_API_KEY:
+        return "[]"
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     body = {
@@ -193,13 +257,17 @@ def main():
             llm = llm["findings"]
     except Exception as e:
         llm = [{
-            "file": "(assistant)",
-            "line_range": [0, 0],
-            "severity": "nit",
-            "confidence": 0.5,
-            "rationale": f"Model call or parsing failed: {e}",
-            "patch": None
-        }]
+    "file": "(assistant)",
+    "line_range": [0, 0],
+    "severity": "nit",
+    "confidence": 0.5,
+    "rationale": (
+        "Model could not be reached right now (likely rate limit). "
+        "I will back off and try again automatically on the next PR update. "
+        "Tip: avoid pushing multiple rapid commits; the workflow cancels older runs."
+    ),
+    "patch": None
+}]
 
     # Merge + filter
     findings = pre + (llm if isinstance(llm, list) else [])
